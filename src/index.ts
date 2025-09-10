@@ -398,6 +398,116 @@ const toolDefinitions = [
       },
       required: ['action']
     }
+  },
+
+  // PERMISSIONS TOOL
+  {
+    name: 'permissions',
+    description: 'Database permissions management: users, roles, grants, privileges',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: {
+          type: 'string',
+          enum: [
+            'list_users', 'list_roles', 'list_grants', 'list_privileges',
+            'create_user', 'create_role', 'drop_user', 'drop_role',
+            'grant_role', 'revoke_role', 'grant_privilege', 'revoke_privilege',
+            'alter_user', 'alter_role', 'check_permissions', 'grant_all_privileges'
+          ],
+          description: 'Permission operation to perform'
+        },
+        username: {
+          type: 'string',
+          description: 'Username for user operations'
+        },
+        rolename: {
+          type: 'string',
+          description: 'Role name for role operations'
+        },
+        password: {
+          type: 'string',
+          description: 'Password for user creation/modification'
+        },
+        database: {
+          type: 'string',
+          description: 'Database name for grants'
+        },
+        schema: {
+          type: 'string',
+          description: 'Schema name for grants'
+        },
+        table: {
+          type: 'string',
+          description: 'Table name for grants'
+        },
+        privileges: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'CREATE', 'CONNECT', 'TEMPORARY', 'EXECUTE', 'USAGE', 'ALL']
+          },
+          description: 'Privileges to grant/revoke'
+        },
+        attributes: {
+          type: 'object',
+          properties: {
+            superuser: { type: 'boolean', description: 'Superuser privilege' },
+            createdb: { type: 'boolean', description: 'Create database privilege' },
+            createrole: { type: 'boolean', description: 'Create role privilege' },
+            replication: { type: 'boolean', description: 'Replication privilege' },
+            login: { type: 'boolean', description: 'Login privilege' },
+            inherit: { type: 'boolean', description: 'Inherit privileges' },
+            bypassrls: { type: 'boolean', description: 'Bypass row level security' }
+          },
+          description: 'User/role attributes'
+        },
+        grantOption: {
+          type: 'boolean',
+          description: 'Grant with GRANT OPTION',
+          default: false
+        }
+      },
+      required: ['operation']
+    }
+  },
+
+  // SECURITY TOOL
+  {
+    name: 'security',
+    description: 'Database security management: SSL, authentication, encryption, auditing',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: {
+          type: 'string',
+          enum: [
+            'check_ssl', 'list_auth_methods', 'check_encryption', 'audit_log',
+            'password_policy', 'connection_limits', 'session_security',
+            'row_level_security', 'column_encryption', 'security_labels'
+          ],
+          description: 'Security operation to perform'
+        },
+        table: {
+          type: 'string',
+          description: 'Table name for RLS operations'
+        },
+        policy_name: {
+          type: 'string',
+          description: 'RLS policy name'
+        },
+        policy_expression: {
+          type: 'string',
+          description: 'RLS policy expression'
+        },
+        audit_type: {
+          type: 'string',
+          enum: ['connections', 'queries', 'ddl', 'dml', 'errors'],
+          description: 'Type of audit information'
+        }
+      },
+      required: ['operation']
+    }
   }
 ];
 
@@ -530,6 +640,12 @@ class PostgresMCPServer {
           
           case 'connections':
             return await this.handleConnections(args);
+          
+          case 'permissions':
+            return await this.handlePermissions(args);
+          
+          case 'security':
+            return await this.handleSecurity(args);
           
           default: {
             const suggestion = suggestToolName(name);
@@ -691,23 +807,243 @@ class PostgresMCPServer {
   }
 
   private async handleSchemas(args: any) {
-    // Placeholder for schema management
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ message: 'Schema management not yet implemented' }, null, 2)
-      }]
-    };
+    const { action, schemaName, owner, options = {} } = args;
+
+    switch (action) {
+      case 'list':
+        const schemas = await this.queryClient.executeQuery(`
+          SELECT 
+            schema_name,
+            schema_owner,
+            CASE 
+              WHEN schema_name IN ('information_schema', 'pg_catalog', 'pg_toast') THEN 'system'
+              ELSE 'user'
+            END as schema_type
+          FROM information_schema.schemata
+          ORDER BY 
+            CASE WHEN schema_name = 'public' THEN 1 ELSE 2 END,
+            schema_type,
+            schema_name
+        `);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(schemas.rows, null, 2)
+          }]
+        };
+
+      case 'create':
+        if (!schemaName) {
+          throw new Error('Schema name is required for create action');
+        }
+        let createSQL = `CREATE SCHEMA ${options.ifNotExists ? 'IF NOT EXISTS ' : ''}${schemaName}`;
+        if (owner) {
+          createSQL += ` AUTHORIZATION ${owner}`;
+        }
+        await this.queryClient.executeQuery(createSQL);
+        return {
+          content: [{
+            type: 'text',
+            text: `Schema '${schemaName}' created successfully`
+          }]
+        };
+
+      case 'drop':
+        if (!schemaName) {
+          throw new Error('Schema name is required for drop action');
+        }
+        const dropSQL = `DROP SCHEMA ${options.ifExists ? 'IF EXISTS ' : ''}${schemaName}${options.cascade ? ' CASCADE' : ''}`;
+        await this.queryClient.executeQuery(dropSQL);
+        return {
+          content: [{
+            type: 'text',
+            text: `Schema '${schemaName}' dropped successfully`
+          }]
+        };
+
+      case 'permissions':
+        if (!schemaName) {
+          throw new Error('Schema name is required for permissions action');
+        }
+        const permissions = await this.queryClient.executeQuery(`
+          SELECT 
+            grantee,
+            privilege_type,
+            is_grantable
+          FROM information_schema.schema_privileges
+          WHERE schema_name = $1
+          ORDER BY grantee, privilege_type
+        `, [schemaName]);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(permissions.rows, null, 2)
+          }]
+        };
+
+      default:
+        throw new Error(`Unknown schema action: ${action}`);
+    }
   }
 
   private async handleIndexes(args: any) {
-    // Placeholder for index management
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ message: 'Index management not yet implemented' }, null, 2)
-      }]
-    };
+    const { action, schemaName = 'public', tableName, indexName, columns, options = {} } = args;
+
+    switch (action) {
+      case 'list':
+        let listQuery;
+        let params: any[] = [];
+        
+        if (tableName) {
+          listQuery = `
+            SELECT 
+              i.indexname as index_name,
+              i.tablename as table_name,
+              i.schemaname as schema_name,
+              pg_get_indexdef(pgc.oid) as definition,
+              CASE WHEN i.indexname ~ '^.*_pkey$' THEN 'PRIMARY KEY'
+                   WHEN idx.indisunique THEN 'UNIQUE'
+                   ELSE 'INDEX' END as index_type,
+              pg_size_pretty(pg_relation_size(pgc.oid)) as size,
+              idx.indisvalid as is_valid
+            FROM pg_indexes i
+            JOIN pg_class pgc ON pgc.relname = i.indexname
+            JOIN pg_index idx ON idx.indexrelid = pgc.oid
+            WHERE i.tablename = $1 AND i.schemaname = $2
+            ORDER BY i.indexname
+          `;
+          params = [tableName, schemaName];
+        } else {
+          listQuery = `
+            SELECT 
+              i.indexname as index_name,
+              i.tablename as table_name,
+              i.schemaname as schema_name,
+              pg_get_indexdef(pgc.oid) as definition,
+              CASE WHEN i.indexname ~ '^.*_pkey$' THEN 'PRIMARY KEY'
+                   WHEN idx.indisunique THEN 'UNIQUE'
+                   ELSE 'INDEX' END as index_type,
+              pg_size_pretty(pg_relation_size(pgc.oid)) as size,
+              idx.indisvalid as is_valid
+            FROM pg_indexes i
+            JOIN pg_class pgc ON pgc.relname = i.indexname
+            JOIN pg_index idx ON idx.indexrelid = pgc.oid
+            WHERE i.schemaname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            ORDER BY i.schemaname, i.tablename, i.indexname
+          `;
+        }
+        
+        const indexes = await this.queryClient.executeQuery(listQuery, params);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(indexes.rows, null, 2)
+          }]
+        };
+
+      case 'create':
+        if (!tableName || !columns || columns.length === 0) {
+          throw new Error('Table name and columns are required for index creation');
+        }
+        
+        const indexNameToUse = indexName || `idx_${tableName}_${columns.join('_')}`;
+        let createIndexSQL = `CREATE${options.unique ? ' UNIQUE' : ''} INDEX${options.concurrent ? ' CONCURRENTLY' : ''}${options.ifNotExists ? ' IF NOT EXISTS' : ''} ${indexNameToUse}`;
+        createIndexSQL += ` ON ${schemaName}.${tableName}`;
+        if (options.method) {
+          createIndexSQL += ` USING ${options.method}`;
+        }
+        createIndexSQL += ` (${columns.join(', ')})`;
+        
+        await this.queryClient.executeQuery(createIndexSQL);
+        return {
+          content: [{
+            type: 'text',
+            text: `Index '${indexNameToUse}' created successfully on ${schemaName}.${tableName}`
+          }]
+        };
+
+      case 'drop':
+        if (!indexName) {
+          throw new Error('Index name is required for drop action');
+        }
+        const dropSQL = `DROP INDEX${options.concurrent ? ' CONCURRENTLY' : ''}${options.ifExists ? ' IF EXISTS' : ''} ${schemaName}.${indexName}`;
+        await this.queryClient.executeQuery(dropSQL);
+        return {
+          content: [{
+            type: 'text',
+            text: `Index '${indexName}' dropped successfully`
+          }]
+        };
+
+      case 'analyze':
+        const analyzeQuery = `
+          SELECT 
+            schemaname,
+            tablename,
+            indexname,
+            idx_tup_read,
+            idx_tup_fetch,
+            idx_scan,
+            CASE WHEN idx_scan = 0 THEN 'UNUSED'
+                 WHEN idx_scan < 10 THEN 'LOW_USAGE'
+                 ELSE 'ACTIVE' END as usage_status
+          FROM pg_stat_user_indexes
+          WHERE schemaname = $1
+          ORDER BY idx_scan DESC
+        `;
+        const stats = await this.queryClient.executeQuery(analyzeQuery, [schemaName]);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(stats.rows, null, 2)
+          }]
+        };
+
+      case 'reindex':
+        if (!indexName && !tableName) {
+          throw new Error('Either index name or table name is required for reindex');
+        }
+        
+        let reindexSQL;
+        if (indexName) {
+          reindexSQL = `REINDEX INDEX${options.concurrent ? ' CONCURRENTLY' : ''} ${schemaName}.${indexName}`;
+        } else {
+          reindexSQL = `REINDEX TABLE${options.concurrent ? ' CONCURRENTLY' : ''} ${schemaName}.${tableName}`;
+        }
+        
+        await this.queryClient.executeQuery(reindexSQL);
+        return {
+          content: [{
+            type: 'text',
+            text: `Reindex completed for ${indexName || tableName}`
+          }]
+        };
+
+      case 'unused':
+        const unusedQuery = `
+          SELECT 
+            schemaname,
+            tablename,
+            indexname,
+            pg_size_pretty(pg_relation_size(indexrelid)) as size,
+            idx_scan as scans
+          FROM pg_stat_user_indexes
+          WHERE idx_scan = 0
+            AND schemaname = $1
+            AND indexname NOT LIKE '%_pkey'
+          ORDER BY pg_relation_size(indexrelid) DESC
+        `;
+        const unused = await this.queryClient.executeQuery(unusedQuery, [schemaName]);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(unused.rows, null, 2)
+          }]
+        };
+
+      default:
+        throw new Error(`Unknown index action: ${action}`);
+    }
   }
 
   private async handleData(args: any) {
@@ -767,13 +1103,186 @@ class PostgresMCPServer {
   }
 
   private async handleAdmin(args: any) {
-    // Placeholder for admin operations
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ message: 'Admin operations not yet implemented' }, null, 2)
-      }]
-    };
+    const { operation, username, password, permissions, tableName, options = {} } = args;
+
+    switch (operation) {
+      case 'database_info':
+        const dbInfo = await this.queryClient.executeQuery(`
+          SELECT 
+            current_database() as database_name,
+            current_user as current_user,
+            session_user as session_user,
+            current_setting('server_version') as postgres_version,
+            current_setting('server_encoding') as encoding,
+            current_setting('timezone') as timezone,
+            pg_database_size(current_database()) as database_size_bytes,
+            pg_size_pretty(pg_database_size(current_database())) as database_size,
+            (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()) as active_connections,
+            current_setting('max_connections') as max_connections,
+            current_setting('shared_buffers') as shared_buffers,
+            current_setting('effective_cache_size') as effective_cache_size
+        `);
+        
+        const tableCount = await this.queryClient.executeQuery(`
+          SELECT count(*) as table_count
+          FROM information_schema.tables 
+          WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+        `);
+        
+        const result = {
+          ...dbInfo.rows[0],
+          table_count: parseInt(tableCount.rows[0].table_count),
+          uptime: await this.getDatabaseUptime()
+        };
+        
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(result, null, 2)
+          }]
+        };
+
+      case 'list_users':
+        const users = await this.queryClient.executeQuery(`
+          SELECT 
+            usename as username,
+            usesysid as user_id,
+            usecreatedb as can_create_db,
+            usesuper as is_superuser,
+            userepl as can_replicate,
+            usebypassrls as bypass_rls,
+            valuntil as password_expires,
+            (SELECT string_agg(datname, ', ') 
+             FROM pg_database 
+             WHERE has_database_privilege(usename, datname, 'CONNECT')) as accessible_databases
+          FROM pg_user
+          ORDER BY usename
+        `);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(users.rows, null, 2)
+          }]
+        };
+
+      case 'create_user':
+        if (!username || !password) {
+          throw new Error('Username and password are required for user creation');
+        }
+        await this.queryClient.executeQuery(`CREATE USER ${username} WITH PASSWORD '${password}'`);
+        return {
+          content: [{
+            type: 'text',
+            text: `User '${username}' created successfully`
+          }]
+        };
+
+      case 'drop_user':
+        if (!username) {
+          throw new Error('Username is required for user deletion');
+        }
+        await this.queryClient.executeQuery(`DROP USER ${username}`);
+        return {
+          content: [{
+            type: 'text',
+            text: `User '${username}' dropped successfully`
+          }]
+        };
+
+      case 'grant_permissions':
+        if (!username || !permissions || permissions.length === 0) {
+          throw new Error('Username and permissions are required');
+        }
+        
+        const target = tableName ? `TABLE ${tableName}` : 'ALL TABLES IN SCHEMA public';
+        const grantSQL = `GRANT ${permissions.join(', ')} ON ${target} TO ${username}`;
+        await this.queryClient.executeQuery(grantSQL);
+        
+        return {
+          content: [{
+            type: 'text',
+            text: `Permissions ${permissions.join(', ')} granted to '${username}' on ${target}`
+          }]
+        };
+
+      case 'revoke_permissions':
+        if (!username || !permissions || permissions.length === 0) {
+          throw new Error('Username and permissions are required');
+        }
+        
+        const revokeTarget = tableName ? `TABLE ${tableName}` : 'ALL TABLES IN SCHEMA public';
+        const revokeSQL = `REVOKE ${permissions.join(', ')} ON ${revokeTarget} FROM ${username}`;
+        await this.queryClient.executeQuery(revokeSQL);
+        
+        return {
+          content: [{
+            type: 'text',
+            text: `Permissions ${permissions.join(', ')} revoked from '${username}' on ${revokeTarget}`
+          }]
+        };
+
+      case 'vacuum':
+        if (tableName) {
+          const vacuumSQL = `VACUUM${options.full ? ' FULL' : ''} ${tableName}`;
+          await this.queryClient.executeQuery(vacuumSQL);
+          return {
+            content: [{
+              type: 'text',
+              text: `Vacuum completed for table '${tableName}'`
+            }]
+          };
+        } else {
+          await this.queryClient.executeQuery('VACUUM');
+          return {
+            content: [{
+              type: 'text',
+              text: 'Database vacuum completed'
+            }]
+          };
+        }
+
+      case 'analyze':
+        if (tableName) {
+          await this.queryClient.executeQuery(`ANALYZE ${tableName}`);
+          return {
+            content: [{
+              type: 'text',
+              text: `Analyze completed for table '${tableName}'`
+            }]
+          };
+        } else {
+          await this.queryClient.executeQuery('ANALYZE');
+          return {
+            content: [{
+              type: 'text',
+              text: 'Database analyze completed'
+            }]
+          };
+        }
+
+      case 'reindex_database':
+        await this.queryClient.executeQuery('REINDEX DATABASE CONCURRENTLY');
+        return {
+          content: [{
+            type: 'text',
+            text: 'Database reindex completed'
+          }]
+        };
+
+      default:
+        throw new Error(`Unknown admin operation: ${operation}`);
+    }
+  }
+
+  private async getDatabaseUptime(): Promise<string> {
+    try {
+      const uptime = await this.queryClient.executeQuery(`
+        SELECT date_trunc('second', now() - pg_postmaster_start_time()) as uptime
+      `);
+      return uptime.rows[0].uptime;
+    } catch (error) {
+      return 'Unable to determine uptime';
+    }
   }
 
   private async handleMonitoring(args: any) {
@@ -837,6 +1346,279 @@ class PostgresMCPServer {
 
       default:
         throw new Error(`Unknown connections action: ${action}`);
+    }
+  }
+
+  private async handlePermissions(args: any) {
+    const { operation, username, rolename, password, database, schema, table, privileges, attributes, grantOption } = args;
+
+    switch (operation) {
+      case 'list_users':
+        const users = await this.queryClient.executeQuery(`
+          SELECT 
+            u.usename as username,
+            u.usesysid as user_id,
+            u.usecreatedb as can_create_db,
+            u.usesuper as is_superuser,
+            u.userepl as can_replicate,
+            u.usebypassrls as bypass_rls,
+            u.valuntil as password_expires,
+            ARRAY(SELECT rolname FROM pg_roles WHERE oid = ANY(u.memberof)) as member_of
+          FROM pg_user u
+          ORDER BY u.usename
+        `);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(users.rows, null, 2)
+          }]
+        };
+
+      case 'list_roles':
+        const roles = await this.queryClient.executeQuery(`
+          SELECT 
+            rolname as role_name,
+            rolsuper as is_superuser,
+            rolinherit as inherits,
+            rolcreaterole as can_create_role,
+            rolcreatedb as can_create_db,
+            rolcanlogin as can_login,
+            rolreplication as can_replicate,
+            rolconnlimit as connection_limit,
+            rolvaliduntil as valid_until,
+            rolbypassrls as bypass_rls
+          FROM pg_roles
+          ORDER BY rolname
+        `);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(roles.rows, null, 2)
+          }]
+        };
+
+      case 'create_user':
+        if (!username || !password) {
+          throw new Error('Username and password are required for user creation');
+        }
+        const createUserSQL = `CREATE USER ${username} WITH PASSWORD '${password}'`;
+        if (attributes) {
+          const attrSQL = Object.entries(attributes)
+            .filter(([, value]) => value === true)
+            .map(([key]) => key.toUpperCase())
+            .join(' ');
+          if (attrSQL) {
+            await this.queryClient.executeQuery(`${createUserSQL} ${attrSQL}`);
+          } else {
+            await this.queryClient.executeQuery(createUserSQL);
+          }
+        } else {
+          await this.queryClient.executeQuery(createUserSQL);
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: `User '${username}' created successfully`
+          }]
+        };
+
+      case 'grant_all_privileges':
+        if (!username || !database) {
+          throw new Error('Username and database are required for granting all privileges');
+        }
+        const grantAllSQL = [
+          `GRANT ALL PRIVILEGES ON DATABASE ${database} TO ${username}`,
+          `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${username}`,
+          `GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${username}`,
+          `GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${username}`
+        ];
+        
+        for (const sql of grantAllSQL) {
+          await this.queryClient.executeQuery(sql);
+        }
+        
+        return {
+          content: [{
+            type: 'text',
+            text: `All privileges granted to '${username}' on database '${database}'`
+          }]
+        };
+
+      case 'grant_privilege':
+        if (!username || !privileges || privileges.length === 0) {
+          throw new Error('Username and privileges are required');
+        }
+        const target = table ? `TABLE ${schema ? schema + '.' : ''}${table}` : 
+                      schema ? `SCHEMA ${schema}` : 
+                      database ? `DATABASE ${database}` : 'ALL TABLES IN SCHEMA public';
+        
+        const grantSQL = `GRANT ${privileges.join(', ')} ON ${target} TO ${username}${grantOption ? ' WITH GRANT OPTION' : ''}`;
+        await this.queryClient.executeQuery(grantSQL);
+        
+        return {
+          content: [{
+            type: 'text',
+            text: `Privileges ${privileges.join(', ')} granted to '${username}' on ${target}`
+          }]
+        };
+
+      case 'check_permissions':
+        if (!username) {
+          throw new Error('Username is required for permission check');
+        }
+        const permissionsQuery = `
+          SELECT 
+            t.schemaname,
+            t.tablename,
+            p.privilege_type
+          FROM information_schema.table_privileges p
+          JOIN information_schema.tables t ON p.table_name = t.table_name AND p.table_schema = t.table_schema
+          WHERE p.grantee = $1
+          ORDER BY t.schemaname, t.tablename, p.privilege_type
+        `;
+        const permissions = await this.queryClient.executeQuery(permissionsQuery, [username]);
+        
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(permissions.rows, null, 2)
+          }]
+        };
+
+      default:
+        throw new Error(`Unknown permissions operation: ${operation}`);
+    }
+  }
+
+  private async handleSecurity(args: any) {
+    const { operation, table, policy_name, policy_expression, audit_type } = args;
+
+    switch (operation) {
+      case 'check_ssl':
+        const sslInfo = await this.queryClient.executeQuery(`
+          SELECT 
+            name,
+            setting,
+            context,
+            short_desc
+          FROM pg_settings 
+          WHERE name LIKE '%ssl%' OR name LIKE '%tls%'
+          ORDER BY name
+        `);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(sslInfo.rows, null, 2)
+          }]
+        };
+
+      case 'list_auth_methods':
+        const authMethods = await this.queryClient.executeQuery(`
+          SELECT 
+            type,
+            database,
+            user_name,
+            address,
+            netmask,
+            auth_method,
+            options,
+            error
+          FROM pg_hba_file_rules
+          ORDER BY line_number
+        `);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(authMethods.rows, null, 2)
+          }]
+        };
+
+      case 'session_security':
+        const sessionInfo = await this.queryClient.executeQuery(`
+          SELECT 
+            inet_client_addr() as client_ip,
+            inet_server_addr() as server_ip,
+            current_user,
+            session_user,
+            current_database(),
+            pg_backend_pid() as backend_pid,
+            pg_is_in_recovery() as in_recovery,
+            current_setting('ssl') as ssl_enabled
+        `);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(sessionInfo.rows[0], null, 2)
+          }]
+        };
+
+      case 'row_level_security':
+        if (!table) {
+          // List all RLS policies
+          const rlsPolicies = await this.queryClient.executeQuery(`
+            SELECT 
+              schemaname,
+              tablename,
+              policyname,
+              permissive,
+              roles,
+              cmd,
+              qual,
+              with_check
+            FROM pg_policies
+            ORDER BY schemaname, tablename, policyname
+          `);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(rlsPolicies.rows, null, 2)
+            }]
+          };
+        } else {
+          // Show RLS status for specific table
+          const rlsStatus = await this.queryClient.executeQuery(`
+            SELECT 
+              schemaname,
+              tablename,
+              rowsecurity,
+              forcerowsecurity
+            FROM pg_tables 
+            WHERE tablename = $1
+          `, [table]);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(rlsStatus.rows, null, 2)
+            }]
+          };
+        }
+
+      case 'audit_log':
+        const auditQuery = `
+          SELECT 
+            datname as database,
+            usename as username,
+            application_name,
+            client_addr,
+            backend_start,
+            query_start,
+            state,
+            query
+          FROM pg_stat_activity 
+          WHERE state = 'active' 
+          ORDER BY query_start DESC
+          LIMIT 50
+        `;
+        const auditInfo = await this.queryClient.executeQuery(auditQuery);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(auditInfo.rows, null, 2)
+          }]
+        };
+
+      default:
+        throw new Error(`Unknown security operation: ${operation}`);
     }
   }
 
