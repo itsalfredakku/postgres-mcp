@@ -63,7 +63,7 @@ export class ConfigManager {
       try {
         fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
       } catch (error) {
-        console.warn('Failed to load config file:', error);
+        // Config file parsing failed - continue with environment variables
       }
     }
 

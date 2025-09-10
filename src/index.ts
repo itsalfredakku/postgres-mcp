@@ -19,6 +19,7 @@ import { ConfigManager } from './config.js';
 import { DatabaseConnectionManager } from './database/connection-manager.js';
 import { QueryAPIClient } from './api/domains/query-api.js';
 import { TablesAPIClient } from './api/domains/tables-api.js';
+import { SchemaAPIClient } from './api/domains/schema-api.js';
 import { logger } from './logger.js';
 import { 
   ParameterValidator, 
@@ -26,6 +27,9 @@ import {
   TOOL_NAME_MAPPINGS, 
   suggestToolName
 } from './validation.js';
+import { QueryResultCache, PerformanceMonitor } from './common/cache.js';
+import { DatabaseError, ErrorHandler, withRetry } from './common/errors.js';
+import { RateLimiter, SecurityValidator } from './common/security.js';
 
 // Load environment variables
 dotenv.config();
@@ -517,6 +521,11 @@ class PostgresMCPServer {
   private dbManager: DatabaseConnectionManager;
   private queryClient: QueryAPIClient;
   private tablesClient: TablesAPIClient;
+  private schemaClient: SchemaAPIClient;
+  private cache: QueryResultCache;
+  private performanceMonitor: PerformanceMonitor;
+  private rateLimiter: RateLimiter;
+  private securityValidator: SecurityValidator;
 
   constructor() {
     this.config = new ConfigManager();
@@ -531,9 +540,26 @@ class PostgresMCPServer {
     // Initialize database connection manager
     this.dbManager = new DatabaseConnectionManager(this.config);
     
+    // Initialize common services
+    this.cache = new QueryResultCache(this.config);
+    this.performanceMonitor = new PerformanceMonitor();
+    this.rateLimiter = new RateLimiter(this.config);
+    this.securityValidator = new SecurityValidator(this.config);
+    
     // Initialize API clients
     this.queryClient = new QueryAPIClient(this.dbManager);
     this.tablesClient = new TablesAPIClient(this.dbManager);
+    this.schemaClient = new SchemaAPIClient(this.dbManager, this.cache);
+    
+    // Add performance monitoring to API clients
+    (this.queryClient as any).performanceMonitor = this.performanceMonitor;
+    (this.tablesClient as any).performanceMonitor = this.performanceMonitor;
+    (this.schemaClient as any).performanceMonitor = this.performanceMonitor;
+    
+    // Add security validation to API clients
+    (this.queryClient as any).securityValidator = this.securityValidator;
+    (this.tablesClient as any).securityValidator = this.securityValidator;
+    (this.schemaClient as any).securityValidator = this.securityValidator;
 
     this.server = new Server(
       {
@@ -671,9 +697,19 @@ class PostgresMCPServer {
           throw ParameterValidator.toMcpError(error);
         }
         
+        // Handle our custom database errors
+        if (error instanceof DatabaseError) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            error.message
+          );
+        }
+        
+        // Handle generic errors with better context
+        const sanitizedError = ErrorHandler.sanitizeError(error);
         throw new McpError(
           ErrorCode.InternalError,
-          `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`
+          `Tool execution failed: ${sanitizedError.message}`
         );
       }
     });
@@ -811,73 +847,60 @@ class PostgresMCPServer {
 
     switch (action) {
       case 'list':
-        const schemas = await this.queryClient.executeQuery(`
-          SELECT 
-            schema_name,
-            schema_owner,
-            CASE 
-              WHEN schema_name IN ('information_schema', 'pg_catalog', 'pg_toast') THEN 'system'
-              ELSE 'user'
-            END as schema_type
-          FROM information_schema.schemata
-          ORDER BY 
-            CASE WHEN schema_name = 'public' THEN 1 ELSE 2 END,
-            schema_type,
-            schema_name
-        `);
+        const schemas = await this.schemaClient.listSchemas(options.includeSystem);
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify(schemas.rows, null, 2)
+            text: JSON.stringify(schemas, null, 2)
+          }]
+        };
+
+      case 'info':
+        ParameterValidator.validateRequired(schemaName, 'schemaName');
+        const schemaInfo = await this.schemaClient.getSchemaInfo(schemaName);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(schemaInfo, null, 2)
           }]
         };
 
       case 'create':
-        if (!schemaName) {
-          throw new Error('Schema name is required for create action');
-        }
-        let createSQL = `CREATE SCHEMA ${options.ifNotExists ? 'IF NOT EXISTS ' : ''}${schemaName}`;
-        if (owner) {
-          createSQL += ` AUTHORIZATION ${owner}`;
-        }
-        await this.queryClient.executeQuery(createSQL);
+        ParameterValidator.validateRequired(schemaName, 'schemaName');
+        const createResult = await this.schemaClient.createSchema(schemaName, {
+          ifNotExists: options.ifNotExists,
+          owner,
+          authorization: options.authorization
+        });
         return {
           content: [{
             type: 'text',
-            text: `Schema '${schemaName}' created successfully`
+            text: JSON.stringify(createResult, null, 2)
           }]
         };
 
       case 'drop':
-        if (!schemaName) {
-          throw new Error('Schema name is required for drop action');
-        }
-        const dropSQL = `DROP SCHEMA ${options.ifExists ? 'IF EXISTS ' : ''}${schemaName}${options.cascade ? ' CASCADE' : ''}`;
-        await this.queryClient.executeQuery(dropSQL);
+        ParameterValidator.validateRequired(schemaName, 'schemaName');
+        const dropResult = await this.schemaClient.dropSchema(
+          schemaName,
+          options.cascade,
+          options.ifExists
+        );
         return {
           content: [{
             type: 'text',
-            text: `Schema '${schemaName}' dropped successfully`
+            text: JSON.stringify(dropResult, null, 2)
           }]
         };
 
-      case 'permissions':
-        if (!schemaName) {
-          throw new Error('Schema name is required for permissions action');
-        }
-        const permissions = await this.queryClient.executeQuery(`
-          SELECT 
-            grantee,
-            privilege_type,
-            is_grantable
-          FROM information_schema.schema_privileges
-          WHERE schema_name = $1
-          ORDER BY grantee, privilege_type
-        `, [schemaName]);
+      case 'rename':
+        ParameterValidator.validateRequired(schemaName, 'schemaName');
+        ParameterValidator.validateRequired(options.newName, 'newName');
+        const renameResult = await this.schemaClient.renameSchema(schemaName, options.newName);
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify(permissions.rows, null, 2)
+            text: JSON.stringify(renameResult, null, 2)
           }]
         };
 
@@ -1298,10 +1321,43 @@ class PostgresMCPServer {
         };
 
       case 'performance':
+        const operationalStats = this.dbManager.getOperationalStats();
+        const performanceMetrics = this.performanceMonitor.getMetrics();
+        const slowOperations = this.performanceMonitor.getSlowOperations();
+        
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify(this.dbManager.getOperationalStats(), null, 2)
+            text: JSON.stringify({
+              operational: operationalStats,
+              performance: performanceMetrics,
+              slowOperations,
+              cache: this.cache.getStats()
+            }, null, 2)
+          }]
+        };
+
+      case 'cache':
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              stats: this.cache.getStats(),
+              recent: this.cache.getRecentEntries(5),
+              popular: this.cache.getPopularEntries(5)
+            }, null, 2)
+          }]
+        };
+
+      case 'security':
+        const rateLimitEntries = Array.from(this.rateLimiter.getAllEntries().entries()).slice(0, 10);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              rateLimits: rateLimitEntries,
+              securityEvents: 'Security event logging would be implemented here'
+            }, null, 2)
           }]
         };
 
@@ -1356,16 +1412,22 @@ class PostgresMCPServer {
       case 'list_users':
         const users = await this.queryClient.executeQuery(`
           SELECT 
-            u.usename as username,
-            u.usesysid as user_id,
-            u.usecreatedb as can_create_db,
-            u.usesuper as is_superuser,
-            u.userepl as can_replicate,
-            u.usebypassrls as bypass_rls,
-            u.valuntil as password_expires,
-            ARRAY(SELECT rolname FROM pg_roles WHERE oid = ANY(u.memberof)) as member_of
-          FROM pg_user u
-          ORDER BY u.usename
+            r.rolname as username,
+            r.oid as user_id,
+            r.rolcreatedb as can_create_db,
+            r.rolsuper as is_superuser,
+            r.rolreplication as can_replicate,
+            r.rolbypassrls as bypass_rls,
+            r.rolvaliduntil as password_expires,
+            ARRAY(
+              SELECT m.rolname 
+              FROM pg_roles m 
+              JOIN pg_auth_members am ON m.oid = am.roleid 
+              WHERE am.member = r.oid
+            ) as member_of
+          FROM pg_roles r
+          WHERE r.rolcanlogin = true
+          ORDER BY r.rolname
         `);
         return {
           content: [{
@@ -1633,10 +1695,26 @@ class PostgresMCPServer {
    * Cleanup resources on shutdown
    */
   async cleanup(): Promise<void> {
-    await this.dbManager.cleanup();
-    logger.info('Server resources cleaned up');
+    try {
+      // Cleanup cache
+      this.cache.cleanup();
+      
+      // Cleanup rate limiter
+      this.rateLimiter.destroy();
+      
+      // Cleanup database manager
+      await this.dbManager.cleanup();
+      
+      logger.info('Server resources cleaned up successfully');
+    } catch (error) {
+      logger.error('Error during cleanup', { error: error instanceof Error ? error.message : error });
+    }
   }
 }
+
+// Export the class for external use
+export { PostgresMCPServer };
+export default PostgresMCPServer;
 
 const skipRuntime = process.env.SKIP_CONFIG_VALIDATION === 'true' || process.env.CI === 'true';
 

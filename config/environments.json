@@ -1,0 +1,99 @@
+{
+  "development": {
+    "database": {
+      "host": "localhost",
+      "port": 5432,
+      "user": "postgres",
+      "database": "postgres_mcp_dev",
+      "ssl": false
+    },
+    "pool": {
+      "min": 2,
+      "max": 10,
+      "idleTimeoutMillis": 30000
+    },
+    "cache": {
+      "enabled": true,
+      "ttl": 300000,
+      "maxKeys": 1000
+    },
+    "rateLimiting": {
+      "maxRequests": 100,
+      "windowMs": 60000
+    },
+    "logging": {
+      "level": "debug",
+      "enableSqlLogging": true
+    },
+    "security": {
+      "maxQueryTime": 30000,
+      "allowedSchemas": ["public", "test"],
+      "restrictedTables": [],
+      "readOnlyMode": false
+    }
+  },
+  "test": {
+    "database": {
+      "host": "localhost",
+      "port": 5432,
+      "user": "postgres",
+      "database": "postgres_mcp_test",
+      "ssl": false
+    },
+    "pool": {
+      "min": 1,
+      "max": 5,
+      "idleTimeoutMillis": 10000
+    },
+    "cache": {
+      "enabled": false,
+      "ttl": 60000,
+      "maxKeys": 100
+    },
+    "rateLimiting": {
+      "maxRequests": 1000,
+      "windowMs": 60000
+    },
+    "logging": {
+      "level": "warn",
+      "enableSqlLogging": false
+    },
+    "security": {
+      "maxQueryTime": 10000,
+      "allowedSchemas": ["public", "test"],
+      "restrictedTables": [],
+      "readOnlyMode": false
+    }
+  },
+  "production": {
+    "database": {
+      "ssl": true,
+      "connectionString": "${DATABASE_URL}"
+    },
+    "pool": {
+      "min": 5,
+      "max": 25,
+      "idleTimeoutMillis": 60000,
+      "acquireTimeoutMillis": 30000
+    },
+    "cache": {
+      "enabled": true,
+      "ttl": 600000,
+      "maxKeys": 5000
+    },
+    "rateLimiting": {
+      "maxRequests": 50,
+      "windowMs": 60000
+    },
+    "logging": {
+      "level": "info",
+      "enableSqlLogging": false
+    },
+    "security": {
+      "maxQueryTime": 60000,
+      "allowedSchemas": ["public"],
+      "restrictedTables": ["pg_user", "pg_shadow", "pg_authid"],
+      "readOnlyMode": false
+    }
+  }
+}
